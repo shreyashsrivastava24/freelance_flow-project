@@ -2,6 +2,7 @@ const express = require('express');
 const TimeLog = require('../models/TimeLog');
 const Project = require('../models/Project');
 const auth = require('../middleware/auth');
+const store = require('../devStore');
 const router = express.Router();
 
 const parseFlexibleDate = (value) => {
@@ -39,6 +40,15 @@ const toValidDate = (value) => {
 // Get all time logs for user
 router.get('/', auth, async (req, res) => {
   try {
+    if (req.useDevStore) {
+      const state = store.read();
+      const logs = state.timelogs
+        .filter((log) => log.user === req.user.id)
+        .sort((a, b) => new Date(b.startTime) - new Date(a.startTime))
+        .map((log) => store.populateProject(log, state));
+      return res.json(logs);
+    }
+
     const logs = await TimeLog.find({ user: req.user.id }).sort({ startTime: -1 }).lean();
     const projectIds = [...new Set(
       logs
@@ -73,6 +83,45 @@ router.post('/', auth, async (req, res) => {
     if (!project) {
       return res.status(400).json({ msg: 'Project is required.' });
     }
+
+    if (req.useDevStore) {
+      const state = store.read();
+      const projectRecord = state.projects.find((item) => item._id === project && item.user === req.user.id);
+      if (!projectRecord) {
+        return res.status(404).json({ msg: 'Selected project was not found for this account.' });
+      }
+      if (!parsedStartTime) {
+        return res.status(400).json({ msg: 'Use a valid date like 2026-04-17.' });
+      }
+      if (durationInMinutes <= 0 && explicitStartTime && explicitEndTime) {
+        durationInMinutes = Math.round((explicitEndTime.getTime() - explicitStartTime.getTime()) / 60000);
+      }
+      if (durationInMinutes <= 0) {
+        return res.status(400).json({ msg: 'Duration must be greater than 0 minutes.' });
+      }
+
+      const parsedEndTime = explicitEndTime || (endTime ? parseFlexibleDate(endTime) : null);
+      const resolvedEndTime = parsedEndTime || new Date(
+        parsedStartTime.getTime() + durationInMinutes * 60 * 1000
+      );
+      const log = {
+        _id: store.id(),
+        user: req.user.id,
+        project,
+        startTime: parsedStartTime.toISOString(),
+        endTime: resolvedEndTime.toISOString(),
+        duration: durationInMinutes,
+        description: description || '',
+        manual: typeof manual === 'boolean' ? manual : !explicitStartTime || Boolean(date || manual),
+        billed: false,
+        createdAt: store.nowIso(),
+        updatedAt: store.nowIso(),
+      };
+      state.timelogs.push(log);
+      store.write(state);
+      return res.json(store.populateProject(log, state));
+    }
+
     const projectRecord = await Project.findOne({ _id: project, user: req.user.id });
     if (!projectRecord) {
       return res.status(404).json({ msg: 'Selected project was not found for this account.' });
@@ -111,6 +160,15 @@ router.post('/', auth, async (req, res) => {
 
 // Update time log
 router.put('/:id', auth, async (req, res) => {
+  if (req.useDevStore) {
+    const state = store.read();
+    const log = state.timelogs.find((item) => item._id === req.params.id && item.user === req.user.id);
+    if (!log) return res.status(404).json({ msg: 'Time log not found.' });
+    Object.assign(log, req.body, { updatedAt: store.nowIso() });
+    store.write(state);
+    return res.json(store.populateProject(log, state));
+  }
+
   const log = await TimeLog.findOneAndUpdate(
     { _id: req.params.id, user: req.user.id },
     req.body,
@@ -121,6 +179,13 @@ router.put('/:id', auth, async (req, res) => {
 
 // Delete time log
 router.delete('/:id', auth, async (req, res) => {
+  if (req.useDevStore) {
+    const state = store.read();
+    state.timelogs = state.timelogs.filter((item) => !(item._id === req.params.id && item.user === req.user.id));
+    store.write(state);
+    return res.json({ msg: 'Deleted' });
+  }
+
   await TimeLog.findOneAndDelete({ _id: req.params.id, user: req.user.id });
   res.json({ msg: 'Deleted' });
 });

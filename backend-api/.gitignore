@@ -1,3 +1,8 @@
 node_modules
 .env
 .env.*
+.vercel
+.mongodb-cache
+.mongodb-tmp
+.data
+*.log

@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState, useRef } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   XAxis,
   YAxis,
@@ -18,6 +18,7 @@ const defaultClientForm = { name: '', email: '', phone: '', company: '', default
 const defaultProjectForm = { client: '', name: '', status: 'active', budget: '' };
 const defaultTaskForm = { project: '', title: '', dueDate: '' };
 const defaultTimeLogForm = { project: '', description: '', duration: '', date: '' };
+const defaultTimerState = { project: '', startedAt: null, isRunning: false, elapsed: 0 };
 
 const navigation = [
   { id: 'dashboard', label: 'Dashboard' },
@@ -29,7 +30,12 @@ const navigation = [
 ];
 
 const fetchJson = async (url, options = {}) => {
-  const response = await fetch(url, options);
+  let response;
+  try {
+    response = await fetch(url, options);
+  } catch {
+    throw new Error(`Cannot reach the API at ${API}. Start the backend server and try again.`);
+  }
   const rawText = await response.text();
   let data = {};
   try {
@@ -48,7 +54,7 @@ function App() {
   const [view, setView] = useState('dashboard');
   const [mode, setMode] = useState('signin');
   const [token, setToken] = useState(() => localStorage.getItem('token'));
-  const [user, setUser] = useState(() => JSON.parse(localStorage.getItem('user') || 'null') || {});
+  const [user, setUser] = useState(getSavedUser);
   const [authForm, setAuthForm] = useState(defaultAuthForm);
   const [clientForm, setClientForm] = useState(defaultClientForm);
   const [projectForm, setProjectForm] = useState(defaultProjectForm);
@@ -65,52 +71,40 @@ function App() {
   const [invoices, setInvoices] = useState([]);
   const [timelogs, setTimelogs] = useState([]);
 
-  // Timer state
-  const [timerProject, setTimerProject] = useState('');
-  const [isRunning, setIsRunning] = useState(false);
-  const [startTime, setStartTime] = useState(null);
-  const timerRef = useRef(null);
-  const [elapsed, setElapsed] = useState(0);
+  const [timer, setTimer] = useState(getSavedTimerState);
+  const { project: timerProject, startedAt: timerStartedAt, isRunning, elapsed } = timer;
 
-  // Load timer from localStorage on mount
   useEffect(() => {
-    const savedStart = localStorage.getItem('timerStart');
-    const savedProject = localStorage.getItem('timerProject');
-    if (savedStart && savedProject) {
-      setStartTime(new Date(savedStart));
-      setTimerProject(savedProject);
-      setIsRunning(true);
-      setElapsed(Date.now() - new Date(savedStart).getTime());
-      // Resume interval
-      timerRef.current = setInterval(() => {
-        setElapsed(Date.now() - new Date(savedStart).getTime());
-      }, 1000);
-    }
-  }, []);
+    if (!isRunning || !timerStartedAt) return undefined;
 
-  // Save to localStorage when starting
+    const tick = () => {
+      setTimer((current) => (
+        current.isRunning && current.startedAt
+          ? { ...current, elapsed: Math.max(0, Date.now() - current.startedAt) }
+          : current
+      ));
+    };
+
+    const intervalId = window.setInterval(tick, 1000);
+    return () => window.clearInterval(intervalId);
+  }, [isRunning, timerStartedAt]);
+
   const startTimer = (projectId) => {
-    const now = new Date();
-    setStartTime(now);
-    setTimerProject(projectId);
-    setIsRunning(true);
-    setElapsed(0);
-    localStorage.setItem('timerStart', now.toISOString());
+    const now = Date.now();
+    setTimer({ project: projectId, startedAt: now, isRunning: true, elapsed: 0 });
+    localStorage.setItem('timerStart', new Date(now).toISOString());
     localStorage.setItem('timerProject', projectId);
-    timerRef.current = setInterval(() => {
-      setElapsed(Date.now() - now.getTime());
-    }, 1000);
   };
 
   const stopTimer = async () => {
-    if (timerRef.current) {
-      clearInterval(timerRef.current);
-      timerRef.current = null;
-    }
-    setIsRunning(false);
+    const activeProject = timerProject;
+    const activeElapsed = elapsed;
+    const activeStartedAt = timerStartedAt;
+    const timestamps = getTimerTimestamps(activeStartedAt, activeElapsed);
+    setTimer(defaultTimerState);
     localStorage.removeItem('timerStart');
     localStorage.removeItem('timerProject');
-    const duration = Math.round(elapsed / 60000); // minutes
+    const duration = Math.round(activeElapsed / 60000); // minutes
     if (duration > 0) {
       // Open modal or auto log with confirmation
       const description = prompt('Add description for this session:', 'Timer session');
@@ -119,26 +113,28 @@ function App() {
           method: 'POST',
           headers: authHeaders,
           body: JSON.stringify({
-            project: timerProject,
+            project: activeProject,
             duration,
             description,
             manual: false,
-            startTime: new Date(Date.now() - elapsed).toISOString(),
-            endTime: new Date().toISOString(),
+            startTime: timestamps.startedAt,
+            endTime: timestamps.endedAt,
           }),
         });
-        fetchAllData(token);
+        try {
+          await fetchAllData(token);
+        } catch {
+          setError('');
+          setSuccess('Time logged, but the dashboard refresh hit a follow-up error.');
+        }
         setSuccess('Time logged from timer!');
       }
     }
-    setElapsed(0);
   };
 
-  const authHeaders = useMemo(() => (
-    token
-      ? { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }
-      : { 'Content-Type': 'application/json' }
-  ), [token]);
+  const authHeaders = token
+    ? { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }
+    : { 'Content-Type': 'application/json' };
 
   const projectMap = useMemo(
     () => new Map(projects.map((project) => [project._id, project])),
@@ -147,26 +143,18 @@ function App() {
 
   const dashboardStats = useMemo(() => {
     const totalMinutes = timelogs.reduce((sum, item) => sum + (Number(item.duration) || 0), 0);
-    const invoiceMinutes = invoices.reduce((sum, item) => sum + (Number(item.total) || 0), 0);
     return {
       clients: clients.length,
       activeProjects: projects.filter((project) => project.status === 'active').length,
       pendingTasks: tasks.filter((task) => !task.completed).length,
       trackedHours: (totalMinutes / 60).toFixed(1),
-      invoiceMinutes,
     };
-  }, [clients, invoices, projects, tasks, timelogs]);
+  }, [clients, projects, tasks, timelogs]);
 
   const unbilledTimeLogs = useMemo(
     () => timelogs.filter((item) => !item.billed),
     [timelogs],
   );
-
-  const revenuePulse = useMemo(() => {
-    if (!invoices.length) return 'No invoices yet';
-    const latest = invoices[0];
-    return `Latest invoice ${formatShortId(latest._id)} for ${latest.client?.name || 'a client'}`;
-  }, [invoices]);
 
   const chartData = useMemo(() => {
     const data = invoices.slice(0, 10).reverse().map(inv => ({
@@ -248,7 +236,7 @@ function App() {
   useEffect(() => {
     if (!token) return undefined;
     const timeoutId = window.setTimeout(() => {
-      fetchAllData(token);
+      fetchAllData(token).catch(() => {});
     }, 0);
     return () => window.clearTimeout(timeoutId);
   }, [fetchAllData, token]);
@@ -300,6 +288,7 @@ function App() {
       try {
         await fetchAllData(token);
       } catch {
+        setError('');
         setSuccess('Saved successfully, but the dashboard refresh hit a follow-up error.');
       }
     } catch (err) {
@@ -466,15 +455,9 @@ function App() {
   const signOut = () => {
     localStorage.removeItem('timerStart');
     localStorage.removeItem('timerProject');
-    if (timerRef.current) {
-      clearInterval(timerRef.current);
-    }
     localStorage.removeItem('token');
     localStorage.removeItem('user');
-    setIsRunning(false);
-    setTimerProject('');
-    setStartTime(null);
-    setElapsed(0);
+    setTimer(defaultTimerState);
     setToken(null);
     setUser({});
     setClients([]);
@@ -717,7 +700,7 @@ function App() {
                     </div>
                   </div>
                   <div className="chart-container">
-                    <ResponsiveContainer width="100%" height="100%">
+                    <ResponsiveContainer width="100%" height={300} minWidth={0}>
                       <BarChart data={chartData} margin={{ top: 20, right: 30, left: 0, bottom: 0 }}>
                         <CartesianGrid strokeDasharray="3 3" stroke="var(--line)" vertical={false} />
                         <XAxis dataKey="name" stroke="var(--text-soft)" tick={{fill: 'var(--text-muted)'}} />
@@ -977,6 +960,14 @@ function App() {
                     <button className="primary-button form-submit" type="submit" disabled={loading || !projects.length}>
                       Add Time Log
                     </button>
+                    <button
+                      className="secondary-button form-submit"
+                      type="button"
+                      disabled={!timeLogForm.project || isRunning}
+                      onClick={() => startTimer(timeLogForm.project)}
+                    >
+                      Start Timer
+                    </button>
                   </form>
                 </section>
                 <section className="content-card">
@@ -1063,7 +1054,7 @@ function App() {
                             <h4>{formatShortId(invoice._id)}</h4>
                             <p>{invoice.client?.name || 'No client'}</p>
                           </div>
-                          <span className="pill">{invoice.total || 0} mins</span>
+                          <span className="pill">{formatCurrency(invoice.total || 0)}</span>
                         </div>
                         <div className="record-meta">
                           <span>{formatDate(invoice.createdAt || invoice.date)}</span>
@@ -1229,6 +1220,42 @@ function normalizeDateInput(value) {
     return `${yyyy}-${mm}-${dd}`;
   }
   return '';
+}
+
+function getSavedTimerState() {
+  const savedStart = localStorage.getItem('timerStart');
+  const savedProject = localStorage.getItem('timerProject');
+  if (!savedStart || !savedProject) return defaultTimerState;
+
+  const startedAt = new Date(savedStart).getTime();
+  if (Number.isNaN(startedAt)) return defaultTimerState;
+
+  return {
+    project: savedProject,
+    startedAt,
+    isRunning: true,
+    elapsed: Math.max(0, Date.now() - startedAt),
+  };
+}
+
+function getSavedUser() {
+  try {
+    return JSON.parse(localStorage.getItem('user') || 'null') || {};
+  } catch {
+    localStorage.removeItem('user');
+    localStorage.removeItem('token');
+    return {};
+  }
+}
+
+function getTimerTimestamps(startedAt, elapsed) {
+  const endedAtMs = Date.now();
+  const startedAtMs = startedAt || endedAtMs - elapsed;
+
+  return {
+    startedAt: new Date(startedAtMs).toISOString(),
+    endedAt: new Date(endedAtMs).toISOString(),
+  };
 }
 
 export default App;

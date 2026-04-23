@@ -4,7 +4,7 @@
   "description": "A B2B SaaS dashboard for freelancers to manage clients, projects, tasks, time tracking, and invoicing in one place.",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "npm --prefix frontend-app run lint && node scripts/check-backend.js",
     "dev": "concurrently \"cd backend-api && nodemon index.js\" \"cd frontend-app && npm run dev\""
   },
   "keywords": [],
