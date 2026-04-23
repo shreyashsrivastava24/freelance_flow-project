@@ -6,6 +6,9 @@ const projectSchema = new mongoose.Schema({
   name: { type: String, required: true },
   status: { type: String, enum: ['active', 'completed', 'on_hold'], default: 'active' },
   budget: { type: Number, default: 0 },
+}, {
+  bufferCommands: false,
 });
+
 
 module.exports = mongoose.model('Project', projectSchema);

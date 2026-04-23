@@ -12,6 +12,7 @@ const invoiceSchema = new mongoose.Schema({
   totalHours: { type: Number, default: 0 },
   pdfUrl: { type: String },
   status: { type: String, enum: ['pending', 'paid'], default: 'pending' },
-}, { timestamps: true });
+}, { timestamps: true, bufferCommands: false });
+
 
 module.exports = mongoose.model('Invoice', invoiceSchema);

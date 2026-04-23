@@ -7,6 +7,9 @@ const clientSchema = new mongoose.Schema({
   phone: { type: String },
   company: { type: String },
   defaultHourlyRate: { type: Number, default: 0 },
+}, {
+  bufferCommands: false,
 });
+
 
 module.exports = mongoose.model('Client', clientSchema);

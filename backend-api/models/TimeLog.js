@@ -9,6 +9,9 @@ const timeLogSchema = new mongoose.Schema({
   description: { type: String, default: '' },
   manual: { type: Boolean, default: false },
   billed: { type: Boolean, default: false },
+}, {
+  bufferCommands: false,
 });
+
 
 module.exports = mongoose.model('TimeLog', timeLogSchema);
