@@ -60,21 +60,13 @@ app.use((err, req, res, next) => {
   res.status(500).json({ msg: err.message || 'Unexpected server error.' });
 });
 
-if (process.env.NODE_ENV !== 'production') {
-  app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-  });
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server running on port ${PORT}`);
+});
 
-  connectDB().catch((err) => {
-    console.error('Initial database connection failed:', err.message);
-    console.error('The API will keep running and retry MongoDB on the next API request.');
-  });
-}
-
-if (process.env.NODE_ENV === 'production') {
-  connectDB().catch((err) => {
-    console.error('MongoDB warmup failed:', err.message);
-  });
-}
+connectDB().catch((err) => {
+  console.error('Initial database connection failed:', err.message);
+  console.error('The API will keep running and retry MongoDB on the next API request.');
+});
 
 module.exports = app;
