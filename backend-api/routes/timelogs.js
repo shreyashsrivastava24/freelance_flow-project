@@ -1,8 +1,10 @@
 const express = require('express');
+const mongoose = require('mongoose');
 const TimeLog = require('../models/TimeLog');
 const Project = require('../models/Project');
 const auth = require('../middleware/auth');
 const store = require('../devStore');
+const { sendDatabaseUnavailable } = require('../utils/databaseErrors');
 const router = express.Router();
 
 const parseFlexibleDate = (value) => {
@@ -67,7 +69,7 @@ router.get('/', auth, async (req, res) => {
     res.json(hydratedLogs);
   } catch (err) {
     console.error('Time log fetch failed:', err);
-    res.status(500).json({ msg: err.message || 'Unable to load time logs.' });
+    return sendDatabaseUnavailable(res, err, 'Unable to load time logs.');
   }
 });
 
@@ -82,6 +84,10 @@ router.post('/', auth, async (req, res) => {
 
     if (!project) {
       return res.status(400).json({ msg: 'Project is required.' });
+    }
+
+    if (!mongoose.isValidObjectId(project)) {
+      return res.status(400).json({ msg: 'Project ID is invalid.' });
     }
 
     if (req.useDevStore) {
@@ -154,7 +160,7 @@ router.post('/', auth, async (req, res) => {
     res.json(await log.populate('project'));
   } catch (err) {
     console.error('Time log creation failed:', err);
-    res.status(500).json({ msg: err.message || 'Unable to create time log.' });
+    return sendDatabaseUnavailable(res, err, 'Unable to create time log.');
   }
 });
 

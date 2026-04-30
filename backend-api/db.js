@@ -1,74 +1,120 @@
 const mongoose = require('mongoose');
 
-// Strictly disable buffering globally to avoid 10s timeouts on Vercel
 mongoose.set('bufferCommands', false);
-mongoose.set('bufferTimeoutMS', 5000); // Fail faster than 10s if something does buffer
+mongoose.set('bufferTimeoutMS', 5000);
 
-let connectionPromise = null;
+const CONNECTION_STATES = {
+  0: 'disconnected',
+  1: 'connected',
+  2: 'connecting',
+  3: 'disconnecting',
+};
+
+const globalMongoose = global.__freelanceFlowMongoose || {
+  connection: null,
+  promise: null,
+  listenersAttached: false,
+  lastError: null,
+};
+
+global.__freelanceFlowMongoose = globalMongoose;
+
 let usingDevStore = false;
+
+const getMaskedUri = (uri) => uri.replace(/:([^@]+)@/, ':****@');
+
+const normalizeMongoUri = (value) => String(value || '')
+  .trim()
+  .replace(/^"(.*)"$/, '$1')
+  .replace(/^'(.*)'$/, '$1');
+
+const getReadyStateLabel = (readyState = mongoose.connection.readyState) =>
+  CONNECTION_STATES[readyState] || 'unknown';
+
+const attachConnectionListeners = () => {
+  if (globalMongoose.listenersAttached) {
+    return;
+  }
+
+  globalMongoose.listenersAttached = true;
+
+  mongoose.connection.on('connected', () => {
+    globalMongoose.lastError = null;
+    console.log('MongoDB connected.');
+  });
+
+  mongoose.connection.on('disconnected', () => {
+    console.warn('MongoDB disconnected.');
+  });
+
+  mongoose.connection.on('error', (error) => {
+    globalMongoose.lastError = error.message;
+    console.error('MongoDB connection error:', error.message);
+  });
+};
+
+attachConnectionListeners();
 
 const connectDB = async () => {
   if (usingDevStore) {
     return null;
   }
 
-  if (mongoose.connection.readyState === 1) {
-    return mongoose.connection;
+  if (globalMongoose.connection && mongoose.connection.readyState === 1) {
+    return globalMongoose.connection;
   }
 
-  if (connectionPromise) {
-    return connectionPromise;
-  }
+  const atlasUri = normalizeMongoUri(process.env.MONGO_URI || process.env.MONGODB_URI);
 
-  connectionPromise = (async () => {
-    // Try both common environment variable names
-    const atlasUri = process.env.MONGO_URI || process.env.MONGODB_URI;
-
-    if (atlasUri) {
-      try {
-        // Mask the URI for logging to help debug without leaking secrets
-        const maskedUri = atlasUri.replace(/:([^@]+)@/, ':****@');
-        console.log(`Attempting MongoDB connection with: ${maskedUri}`);
-
-        await mongoose.connect(atlasUri, {
-          serverSelectionTimeoutMS: 5000,
-          connectTimeoutMS: 10000,
-          socketTimeoutMS: 45000,
-        });
-
-        console.log('MongoDB connected (Atlas)');
-        return mongoose.connection;
-      } catch (err) {
-        console.warn('Atlas connection failed:', err.message);
-        
-        if (mongoose.connection.readyState !== 0) {
-          await mongoose.disconnect().catch(() => {});
-        }
-
-        if (process.env.NODE_ENV === 'production') {
-          console.error('CRITICAL: Database connection failed in production.');
-          throw err;
-        }
-
-        usingDevStore = true;
-        console.log('Using local JSON dev database fallback.');
-        return null;
-      }
-    } else if (process.env.NODE_ENV === 'production') {
-      console.error('CRITICAL: MONGO_URI or MONGODB_URI is missing in production.');
+  if (!atlasUri) {
+    if (process.env.NODE_ENV === 'production') {
       throw new Error('MONGO_URI is required in production.');
     }
 
     usingDevStore = true;
     console.log('Using local JSON dev database fallback.');
     return null;
-  })();
+  }
+
+  if (!/^mongodb(\+srv)?:\/\//.test(atlasUri)) {
+    throw new Error('MONGO_URI must start with mongodb:// or mongodb+srv://');
+  }
+
+  if (!globalMongoose.promise) {
+    const maskedUri = getMaskedUri(atlasUri);
+    console.log(`Attempting MongoDB connection with: ${maskedUri}`);
+    globalMongoose.lastError = null;
+
+    globalMongoose.promise = mongoose.connect(atlasUri, {
+      serverSelectionTimeoutMS: 10000,
+      connectTimeoutMS: 10000,
+      socketTimeoutMS: 45000,
+      maxPoolSize: 10,
+    });
+  }
 
   try {
-    return await connectionPromise;
+    await globalMongoose.promise;
+    globalMongoose.connection = mongoose.connection;
+    return globalMongoose.connection;
   } catch (err) {
-    connectionPromise = null; // Reset for next attempt
-    throw err;
+    globalMongoose.promise = null;
+    globalMongoose.connection = null;
+    globalMongoose.lastError = err.message;
+
+    if (mongoose.connection.readyState !== 0) {
+      await mongoose.disconnect().catch(() => {});
+    }
+
+    console.error('MongoDB connection failed:', err.message);
+
+    if (process.env.NODE_ENV === 'production') {
+      throw err;
+    }
+
+    usingDevStore = true;
+    console.log('Using local JSON dev database fallback.');
+    return null;
   }
 };
 
@@ -80,7 +126,7 @@ connectDB.ensureConnected = async (req, res, next) => {
   } catch (err) {
     console.error('Database middleware error:', err.message);
     res.status(503).json({
-      msg: 'Database unavailable. Please verify your MONGO_URI and MongoDB Atlas IP Whitelist (allow 0.0.0.0/0).',
+      msg: 'Database unavailable. Verify your environment variables and MongoDB Atlas network access.',
       detail: process.env.NODE_ENV === 'production' ? undefined : err.message,
     });
   }
@@ -88,5 +134,12 @@ connectDB.ensureConnected = async (req, res, next) => {
 
 connectDB.isUsingDevStore = () => usingDevStore;
 
-module.exports = connectDB;
+connectDB.getStatus = () => ({
+  readyState: mongoose.connection.readyState,
+  state: getReadyStateLabel(),
+  usingDevStore,
+  hasMongoUri: Boolean(normalizeMongoUri(process.env.MONGO_URI || process.env.MONGODB_URI)),
+  lastError: globalMongoose.lastError,
+});
 
+module.exports = connectDB;

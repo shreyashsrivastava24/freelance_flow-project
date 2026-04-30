@@ -1,14 +1,14 @@
 const express = require('express');
+const mongoose = require('mongoose');
 const Invoice = require('../models/Invoice');
 const TimeLog = require('../models/TimeLog');
 const Client = require('../models/Client');
 const User = require('../models/User');
 const auth = require('../middleware/auth');
 const PDFDocument = require('pdfkit');
-const fs = require('fs');
-const path = require('path');
 const Project = require('../models/Project');
 const store = require('../devStore');
+const { sendDatabaseUnavailable } = require('../utils/databaseErrors');
 const router = express.Router();
 
 const parseDateBoundary = (value, boundary) => {
@@ -23,14 +23,14 @@ const parseDateBoundary = (value, boundary) => {
   return date;
 };
 
-const generateInvoicePdf = ({ invoice, invoiceClient, logs, hourlyRate, totalHours, total }) => {
-  const invoicesDir = path.join(__dirname, '../invoices');
-  fs.mkdirSync(invoicesDir, { recursive: true });
+const buildPdfUrl = (invoiceId) => `/api/invoices/${invoiceId}/pdf`;
 
+const generateInvoicePdfBuffer = ({ invoice, invoiceClient, logs, hourlyRate, totalHours, total }) => {
   const invoiceId = String(invoice._id);
   const doc = new PDFDocument({ margin: 72, size: 'A4' });
-  const pdfPath = path.join(invoicesDir, `invoice_${invoiceId}.pdf`);
-  doc.pipe(fs.createWriteStream(pdfPath));
+  const chunks = [];
+
+  doc.on('data', (chunk) => chunks.push(chunk));
 
   doc.fontSize(24).fillColor('#1a1a1a').text('INVOICE', 72, 72, { align: 'center', width: 468 });
   doc.fontSize(10).fillColor('#666').text(`Invoice ID: ${invoiceId}`, 72, 110);
@@ -98,7 +98,64 @@ const generateInvoicePdf = ({ invoice, invoiceClient, logs, hourlyRate, totalHou
     .text('Thank you for your business!', tableLeft, 750, { align: 'center', width: tableWidth });
 
   doc.end();
-  return `/invoices/invoice_${invoiceId}.pdf`;
+
+  return new Promise((resolve, reject) => {
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+    doc.on('error', reject);
+  });
+};
+
+const getDevInvoicePdfContext = (invoice, state, userId) => {
+  const invoiceClient = state.clients.find((client) => client._id === invoice.client && client.user === userId);
+  if (!invoiceClient) {
+    return null;
+  }
+
+  const logs = invoice.timeLogs
+    .map((id) => state.timelogs.find((log) => log._id === id && log.user === userId))
+    .filter(Boolean)
+    .sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
+
+  if (!logs.length) {
+    return null;
+  }
+
+  const totalHours = Number(invoice.totalHours) || logs.reduce((sum, log) => sum + (Number(log.duration) || 0), 0) / 60;
+  const total = Number(invoice.total) || 0;
+  const hourlyRate = totalHours > 0
+    ? total / totalHours
+    : Number(invoiceClient.defaultHourlyRate) || 0;
+
+  return { invoiceClient, logs, totalHours, total, hourlyRate };
+};
+
+const getMongoInvoicePdfContext = async (invoiceId, userId) => {
+  const invoice = await Invoice.findOne({ _id: invoiceId, user: userId }).lean();
+  if (!invoice) {
+    return null;
+  }
+
+  const invoiceClient = await Client.findOne({ _id: invoice.client, user: userId }).lean();
+  if (!invoiceClient) {
+    return null;
+  }
+
+  const logs = await TimeLog.find({
+    _id: { $in: invoice.timeLogs || [] },
+    user: userId,
+  }).sort({ startTime: 1 }).lean();
+
+  if (!logs.length) {
+    return null;
+  }
+
+  const totalHours = Number(invoice.totalHours) || logs.reduce((sum, log) => sum + (Number(log.duration) || 0), 0) / 60;
+  const total = Number(invoice.total) || 0;
+  const hourlyRate = totalHours > 0
+    ? total / totalHours
+    : Number(invoiceClient.defaultHourlyRate) || 0;
+
+  return { invoice, invoiceClient, logs, totalHours, total, hourlyRate };
 };
 
 // Create invoice
@@ -107,6 +164,10 @@ router.post('/', auth, async (req, res) => {
     const { client, timeLogIds = [], startDate, endDate } = req.body;
     if (!client) {
       return res.status(400).json({ msg: 'A client is required to create an invoice.' });
+    }
+
+    if (!mongoose.isValidObjectId(client)) {
+      return res.status(400).json({ msg: 'Client ID is invalid.' });
     }
 
     if (req.useDevStore) {
@@ -170,7 +231,7 @@ router.post('/', auth, async (req, res) => {
         createdAt: store.nowIso(),
         updatedAt: store.nowIso(),
       };
-      invoice.pdfUrl = generateInvoicePdf({ invoice, invoiceClient, logs, hourlyRate, totalHours, total });
+      invoice.pdfUrl = buildPdfUrl(invoice._id);
       state.invoices.push(invoice);
       logs.forEach((log) => {
         log.billed = true;
@@ -245,12 +306,66 @@ router.post('/', auth, async (req, res) => {
       { billed: true }
     );
 
-    invoice.pdfUrl = generateInvoicePdf({ invoice, invoiceClient, logs, hourlyRate, totalHours, total });
+    invoice.pdfUrl = buildPdfUrl(invoice._id);
     await invoice.save();
 
     res.json(await Invoice.findById(invoice._id).populate('client').populate('timeLogs'));
   } catch (err) {
-    res.status(500).json({ msg: err.message || 'Unable to create invoice.' });
+    return sendDatabaseUnavailable(res, err, 'Unable to create invoice.');
+  }
+});
+
+router.get('/:id/pdf', auth, async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ msg: 'Invoice ID is invalid.' });
+    }
+
+    if (req.useDevStore) {
+      const state = store.read();
+      const invoice = state.invoices.find((item) => item._id === req.params.id && item.user === req.user.id);
+      if (!invoice) {
+        return res.status(404).json({ msg: 'Invoice not found.' });
+      }
+
+      const pdfContext = getDevInvoicePdfContext(invoice, state, req.user.id);
+      if (!pdfContext) {
+        return res.status(400).json({ msg: 'Invoice PDF data is incomplete.' });
+      }
+
+      const pdfBuffer = await generateInvoicePdfBuffer({
+        invoice,
+        invoiceClient: pdfContext.invoiceClient,
+        logs: pdfContext.logs,
+        hourlyRate: pdfContext.hourlyRate,
+        totalHours: pdfContext.totalHours,
+        total: pdfContext.total,
+      });
+
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="invoice-${invoice._id}.pdf"`);
+      return res.send(pdfBuffer);
+    }
+
+    const pdfContext = await getMongoInvoicePdfContext(req.params.id, req.user.id);
+    if (!pdfContext) {
+      return res.status(404).json({ msg: 'Invoice not found.' });
+    }
+
+    const pdfBuffer = await generateInvoicePdfBuffer({
+      invoice: pdfContext.invoice,
+      invoiceClient: pdfContext.invoiceClient,
+      logs: pdfContext.logs,
+      hourlyRate: pdfContext.hourlyRate,
+      totalHours: pdfContext.totalHours,
+      total: pdfContext.total,
+    });
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="invoice-${pdfContext.invoice._id}.pdf"`);
+    return res.send(pdfBuffer);
+  } catch (err) {
+    return sendDatabaseUnavailable(res, err, 'Unable to generate invoice PDF.');
   }
 });
 
@@ -259,37 +374,13 @@ router.get('/', auth, async (req, res) => {
   try {
     if (req.useDevStore) {
       const state = store.read();
-      let generatedMissingPdfs = false;
-      state.invoices
-        .filter((invoice) => invoice.user === req.user.id && !invoice.pdfUrl)
-        .forEach((invoice) => {
-          const invoiceClient = state.clients.find((client) => client._id === invoice.client && client.user === req.user.id);
-          const logs = invoice.timeLogs
-            .map((id) => state.timelogs.find((log) => log._id === id && log.user === req.user.id))
-            .filter(Boolean)
-            .sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
-
-          if (!invoiceClient || !logs.length) return;
-
-          const totalHours = Number(invoice.totalHours) || logs.reduce((sum, log) => sum + (Number(log.duration) || 0), 0) / 60;
-          const total = Number(invoice.total) || 0;
-          const hourlyRate = totalHours > 0
-            ? total / totalHours
-            : Number(invoiceClient.defaultHourlyRate) || 0;
-
-          invoice.pdfUrl = generateInvoicePdf({ invoice, invoiceClient, logs, hourlyRate, totalHours, total });
-          invoice.updatedAt = store.nowIso();
-          generatedMissingPdfs = true;
-        });
-
-      if (generatedMissingPdfs) {
-        store.write(state);
-      }
-
       const invoices = state.invoices
         .filter((invoice) => invoice.user === req.user.id)
         .sort((a, b) => new Date(b.createdAt || b.date) - new Date(a.createdAt || a.date))
-        .map((invoice) => store.populateInvoice(invoice, state));
+        .map((invoice) => ({
+          ...store.populateInvoice(invoice, state),
+          pdfUrl: buildPdfUrl(invoice._id),
+        }));
       return res.json(invoices);
     }
 
@@ -297,9 +388,16 @@ router.get('/', auth, async (req, res) => {
       .sort({ createdAt: -1, date: -1 })
       .populate('client')
       .populate('timeLogs');
-    res.json(invoices);
+    const hydratedInvoices = invoices.map((invoice) => {
+      const json = invoice.toObject();
+      return {
+        ...json,
+        pdfUrl: buildPdfUrl(json._id),
+      };
+    });
+    res.json(hydratedInvoices);
   } catch (err) {
-    res.status(500).json({ msg: err.message || 'Unable to load invoices.' });
+    return sendDatabaseUnavailable(res, err, 'Unable to load invoices.');
   }
 });
 

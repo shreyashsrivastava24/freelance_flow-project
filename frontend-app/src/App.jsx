@@ -1060,9 +1060,13 @@ function App() {
                           <span>{formatDate(invoice.createdAt || invoice.date)}</span>
                           <span>{invoice.status || 'pending'}</span>
                           {invoice.pdfUrl && (
-                            <a href={`${API.replace('/api', '')}${invoice.pdfUrl}`} download target="_blank" className="pdf-download" rel="noopener noreferrer">
-                              📄 Download PDF
-                            </a>
+                            <button
+                              type="button"
+                              className="pdf-download"
+                              onClick={() => downloadInvoicePdf(invoice._id)}
+                            >
+                              Download PDF
+                            </button>
                           )}
                         </div>
                       </article>
@@ -1235,6 +1239,38 @@ function getSavedTimerState() {
     startedAt,
     isRunning: true,
     elapsed: Math.max(0, Date.now() - startedAt),
+  };
+
+  const downloadInvoicePdf = async (invoiceId) => {
+    resetAlerts();
+    try {
+      const response = await fetch(`${API}/invoices/${invoiceId}/pdf`, {
+        headers: authHeaders,
+      });
+      const rawText = response.ok ? '' : await response.text();
+
+      if (!response.ok) {
+        let data = {};
+        try {
+          data = rawText ? JSON.parse(rawText) : {};
+        } catch {
+          data = {};
+        }
+        throw new Error(data.msg || data.message || `Unable to download invoice (${response.status}).`);
+      }
+
+      const blob = await response.blob();
+      const blobUrl = window.URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = blobUrl;
+      anchor.download = `invoice-${invoiceId}.pdf`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.URL.revokeObjectURL(blobUrl);
+    } catch (err) {
+      setError(err.message);
+    }
   };
 }
 
